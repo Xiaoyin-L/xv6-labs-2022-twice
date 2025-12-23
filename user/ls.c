@@ -27,7 +27,7 @@ ls(char *path)
 {
   char buf[512], *p;
   int fd;
-  struct dirent de;
+  struct dirent de; // 目录项结构（16字节：2字节inum + 14字节name）
   struct stat st;
 
   if((fd = open(path, 0)) < 0){
