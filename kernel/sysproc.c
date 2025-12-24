@@ -91,3 +91,29 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+
+uint64
+sys_trace(void)
+{
+  int mask;
+  struct proc *p = myproc();
+
+  argint(0, &mask); //读取来自用户传入的mask
+  if(mask < 0)
+    mask = 0;
+
+  p->sysmask = mask;
+  
+
+  return 0;
+}
+
+uint64
+sys_sysinfo(void)
+{
+  
+  
+
+  return 0;
+}
