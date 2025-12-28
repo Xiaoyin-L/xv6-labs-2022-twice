@@ -49,11 +49,77 @@ kvmmake(void)
   return kpgtbl;
 }
 
+void
+kvm_free_kernelpgtbl(pagetable_t pagetable)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    uint64 child = PTE2PA(pte);
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){ // 如果该页表项指向更低一级的页表
+      // 递归释放低一级页表及其页表项
+      kvm_free_kernelpgtbl((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void*)pagetable); // 释放当前级别页表所占用空间
+}
+
+uint64
+kvmpa(pagetable_t pgtbl, uint64 va)
+{
+  uint64 off = va % PGSIZE;
+  pte_t *pte;
+  uint64 pa;
+
+  pte = walk(pgtbl, va, 0);
+  if(pte == 0)
+    panic("kvmpa");
+  if((*pte & PTE_V) == 0)
+    panic("kvmpa");
+  pa = PTE2PA(*pte);
+  return pa+off;
+}
+
+// map the every process kernel_pagetable
+void kvm_proc_map(pagetable_t proc_pgtbl)
+{
+  // uart registers
+  kvmmap(proc_pgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  kvmmap(proc_pgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // PLIC
+  kvmmap(proc_pgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  kvmmap(proc_pgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  kvmmap(proc_pgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  kvmmap(proc_pgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  
+}
+
+//Initialize the every process kernel_pagetable
+pagetable_t
+kvminit_proc(void)
+{
+  pagetable_t proc_pgtbl = (pagetable_t) kalloc();
+  memset(proc_pgtbl, 0, PGSIZE);
+
+  kvm_proc_map(proc_pgtbl);
+  return proc_pgtbl;
+}
+
 // Initialize the one kernel_pagetable
 void
 kvminit(void)
 {
-  kernel_pagetable = kvmmake();
+  kernel_pagetable = kvminit_proc();
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -436,4 +502,33 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+static void vmprint_r(pagetable_t pagetable, int depth)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) != 0){
+      for(int j = 0; j < depth; j++){
+        if (j==0)printf("..");
+        else printf(" ..");
+      }
+      if (depth>0) printf(" ");
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      
+      printf("%d: pte %p pa %p\n", i, (uint64)pte, child);
+      if ((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+          vmprint_r((pagetable_t)child, depth+1);
+      }
+      
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable){
+  printf("page table %p\n", pagetable);
+  vmprint_r(pagetable, 0);
 }

@@ -54,7 +54,7 @@ procinit(void)
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
-      p->kstack = KSTACK((int) (p - proc));
+      //p->kstack = KSTACK((int) (p - proc));修改为在创建进程的时候为内核分配独立的内核页表和内核栈
   }
 }
 
@@ -140,6 +140,17 @@ found:
     return 0;
   }
 
+  // new 
+  // 新进程创建独立的内核页表，并将内核所需要的各种映射添加到新页表上
+  p->kernelpgtbl = kvminit_proc();
+  // 分配一个物理页，作为新进程的内核栈使用
+  char *pa = kalloc();
+ if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int)0); // 将内核栈映射到固定的逻辑地址上
+  kvmmap(p->kernelpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va; // 记录内核栈的逻辑地址
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -169,6 +180,14 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  void *kstack_pa = (void *)kvmpa(p->kernelpgtbl, p->kstack);
+  kfree(kstack_pa);
+  p->kstack = 0;
+
+  kvm_free_kernelpgtbl(p->kernelpgtbl);
+  p->kernelpgtbl = 0;
+  
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -460,6 +479,11 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        //切换到内核进程页表
+        w_satp(MAKE_SATP(p->kernelpgtbl));
+        sfence_vma();// 清除快表缓存
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
