@@ -134,7 +134,7 @@ runcmd(struct cmd *cmd)
 int
 getcmd(char *buf, int nbuf)
 {
-  write(2, "$ ", 2);
+  write(2, "$ ", 2); //将$ 写入stderr而不是stdout，可以避免$和输出交叉污染
   memset(buf, 0, nbuf);
   gets(buf, nbuf);
   if(buf[0] == 0) // EOF
@@ -149,7 +149,7 @@ main(void)
   int fd;
 
   // Ensure that three file descriptors are open.
-  while((fd = open("console", O_RDWR)) >= 0){
+  while((fd = open("console", O_RDWR)) >= 0){ // 强制打开stdin,stdout,stderr
     if(fd >= 3){
       close(fd);
       break;

@@ -70,7 +70,7 @@ gets(char *buf, int max)
   char c;
 
   for(i=0; i+1 < max; ){
-    cc = read(0, &c, 1);
+    cc = read(0, &c, 1); //从stdin中读取一个字节到c
     if(cc < 1)
       break;
     buf[i++] = c;
