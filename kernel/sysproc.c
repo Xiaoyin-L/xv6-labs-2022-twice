@@ -92,3 +92,30 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sigalarm(void)
+{
+  struct proc* p = myproc();
+  // 读取用户态传入的参数  时间间隔和处理函数
+  argint(0, &p->AlarmInteval); 
+  argaddr(1, &p->Handler); 
+
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc* p = myproc();
+  
+  // 恢复现场并将计数器和标志重置
+  memmove(p->trapframe, &p->Alarmtrapframe, sizeof(struct trapframe)); 
+
+  
+  p->Counter = 0;
+  p->InHandler = 0;
+
+  // 相当于返回值也使用之前的a0
+  return p->trapframe->a0;
+}

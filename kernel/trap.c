@@ -75,6 +75,23 @@ usertrap(void)
 
   if(killed(p))
     exit(-1);
+  
+  if(which_dev==2 && p->AlarmInteval!=0 && p->InHandler==0 ){
+    p->Counter++; //记录tick次数
+
+    // 到达设定间隔则触发处理
+    if(p->Counter == p->AlarmInteval){
+
+      // 保存原有的trapframe
+      memmove(&p->Alarmtrapframe, p->trapframe, sizeof(struct trapframe));
+
+      // 修改trapframe中的epc，使得陷阱将会返回到用户态下的handler函数中
+      p->trapframe->epc = p->Handler;
+
+      // 设置标志位表示已在handler中
+      p->InHandler = 1;
+    }
+  }
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
