@@ -5,6 +5,9 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
+
 
 /*
  * the kernel's page table.
@@ -180,7 +183,8 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      //panic("uvmunmap: not mapped");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -436,4 +440,41 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// 传入虚拟地址，判断该虚拟地址是否是惰性分配的，即
+// 1. 该虚拟地址在进程的地址空间内 2. 虚拟地址不属于guard page 3. 对应页表页表项不存在
+uint64
+uvmlazyalloc_test(uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+
+  if ((va < p->sz) && PGROUNDDOWN(va) != r_sp() && (((pte = walk(p->pagetable, va, 0))==0) || ((*pte & PTE_V)==0))){
+    return 1;
+  }
+  return 0;
+}
+
+// 分配物理页面并建立映射，只需要对当前的page进行分配
+void
+uvmlazyalloc(uint64 va)
+{
+  char *mem;
+  struct proc *p = myproc();
+
+  mem = kalloc();
+    if(mem == 0){
+      printf("lazy alloc: out of memory\n");
+      setkilled(p);
+    }
+    else {
+      memset(mem, 0, PGSIZE);
+      if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+        kfree(mem);
+        printf("lazy alloc: failed to map page\n");
+
+        setkilled(p);
+      }
+    }
 }

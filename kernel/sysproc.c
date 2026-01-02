@@ -40,11 +40,15 @@ sys_sbrk(void)
 {
   uint64 addr;
   int n;
-
+  struct proc *p = myproc();
   argint(0, &n);
-  addr = myproc()->sz;
-  if(growproc(n) < 0)
-    return -1;
+  addr = p->sz;
+  //if(growproc(n) < 0)
+    //return -1;
+
+  if(n < 0)
+    uvmdealloc(p->pagetable, p->sz, p->sz + n);// 缩小空间，即n<0，则释放
+  p->sz += n;
   return addr;
 }
 

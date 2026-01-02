@@ -67,7 +67,22 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  } else if(r_scause() == 13 || r_scause() == 15) {
+    // 表示触发页面错误
+    uint64 fault_va = r_stval();
+    // 判断是否惰性分配
+    if(uvmlazyalloc_test(fault_va)){
+      printf("start lazy alloc\n");
+      uvmlazyalloc(fault_va); //如果是，则调用处理函数
+    } 
+    else {
+      printf("don't start lazy alloc\n");
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      setkilled(p);
+    }
+  } 
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     setkilled(p);
