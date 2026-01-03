@@ -67,7 +67,52 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  } else if(r_scause() == 15){
+    pte_t *pte;
+    uint64 fault_va = r_stval();
+    if(fault_va > MAXVA){
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      setkilled(p);
+    }
+
+    pte = walk(p->pagetable, fault_va, 0);
+    if((*pte & PTE_COW) == 0){
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      setkilled(p);
+    }
+
+    uint64 pa = PTE2PA(*pte);
+    uint flags = PTE_FLAGS(*pte);
+    acquire(&refpagelock);
+    if(refcount[pa/PGSIZE] > 1){
+      refcount[pa/PGSIZE]--;//减少引用记数
+      release(&refpagelock);
+
+      // 开始分配一个物理页面
+      char *mem;
+      if((mem = kalloc()) == 0){
+        setkilled(p);
+      }
+      else {
+        memmove(mem, (char*)pa, PGSIZE);
+
+        fault_va = PGROUNDDOWN(fault_va);//下取整以对齐
+        uvmunmap(p->pagetable, fault_va, 1, 0); 
+        if(mappages(p->pagetable, fault_va, PGSIZE, (uint64)mem, (flags | PTE_W) & ~PTE_COW) != 0){ // 子进程的虚拟页映射到新的物理页
+          kfree(mem);
+          setkilled(p);
+        }
+      }
+    }
+    else {
+      release(&refpagelock);
+      *pte |= PTE_W;//减少到只有一个进程引用时恢复写权限
+      *pte &= ~PTE_COW;//取消cow
+    }    
+  } 
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     setkilled(p);

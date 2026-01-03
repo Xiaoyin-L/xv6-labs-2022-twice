@@ -63,6 +63,8 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+extern struct spinlock refpagelock;
+extern int refcount[32768];
 
 // log.c
 void            initlog(int, struct superblock*);

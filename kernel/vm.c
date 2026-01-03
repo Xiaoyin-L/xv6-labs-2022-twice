@@ -3,8 +3,11 @@
 #include "memlayout.h"
 #include "elf.h"
 #include "riscv.h"
+#include "spinlock.h"
 #include "defs.h"
 #include "fs.h"
+#include "proc.h"
+
 
 /*
  * the kernel's page table.
@@ -308,21 +311,31 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+    if (*pte & PTE_W){ // 清除父进程的`PTE_W`标志
+      *pte = *pte & ~PTE_W;
+      *pte = *pte | PTE_COW;
+    }
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    //if((mem = kalloc()) == 0)
+      //goto err;
+    //memmove(mem, (char*)pa, PGSIZE);
+    //if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+      //kfree(mem);
+      //goto err;
+   // }
+    acquire(&refpagelock);
+    refcount[pa/PGSIZE]++;//增加对应物理页的引用计数
+    release(&refpagelock);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){ // 子进程的虚拟页映射
+      goto err; 
     }
   }
   return 0;
@@ -361,7 +374,38 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
-    memmove((void *)(pa0 + (dstva - va0)), src, n);
+
+    struct proc *p = myproc();
+    pte_t *pte = walk(p->pagetable, va0, 0);
+    uint flags = PTE_FLAGS(*pte);
+    acquire(&refpagelock);
+    if(refcount[pa0/PGSIZE] > 1){
+      refcount[pa0/PGSIZE]--;//减少引用记数
+      release(&refpagelock);
+
+      // 开始分配一个物理页面
+      char *mem;
+      if((mem = kalloc()) == 0){
+        setkilled(p);
+      }
+      else {
+        memmove(mem, (char*)pa0, PGSIZE);
+        uvmunmap(p->pagetable, va0, 1, 0); 
+        if(mappages(p->pagetable, va0, PGSIZE, (uint64)mem, flags) != 0){ // 子进程的虚拟页映射到新的物理页
+          kfree(mem);
+          setkilled(p);
+        }
+        else {
+          memmove((void *)(mem + (dstva - va0)), src, n);
+        }
+      }
+    }
+    else {
+      release(&refpagelock);
+      memmove((void *)(pa0 + (dstva - va0)), src, n);
+    }
+    if(killed(p))
+      exit(-1);
 
     len -= n;
     src += n;
