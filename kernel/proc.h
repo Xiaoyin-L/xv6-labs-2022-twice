@@ -104,4 +104,7 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  int priority;   // 优先级
+  int wait_time;  // 记录在 RUNNABLE 状态等待时间
 };

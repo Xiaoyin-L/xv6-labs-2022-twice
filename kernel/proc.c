@@ -125,6 +125,10 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  // 初始化优先级,等待时间
+  p->priority = 5;
+  p->wait_time = 0;
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -437,29 +441,73 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    struct proc *best_p = 0;
+    int max_priority = -1; // 记录当前发现的最高优先级
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    /* 第一轮遍历
+     * 寻找优先级最高的 Runnable 进程
+     * 更新所有 Runnable 进程的等待时间
+    */
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if(p->state == RUNNABLE){
+        // 增加等待时间 
+         p->wait_time++;
+
+         // 计算动态优先级, 基础优先级 + 老化
+         int effective_priority = p->priority + (p->wait_time / 10);
+         if(effective_priority > 20) effective_priority = 20;
+         // int effective_priority = p->priority;
+
+         // 选择最高优先级进程
+        if(effective_priority > max_priority){
+          if(best_p != 0) {
+            release(&best_p->lock);
+          }
+
+          max_priority = effective_priority;
+          best_p = p;
+          continue;
+        }
       }
       release(&p->lock);
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
+
+    /* 找到最高优先级进程 */
+    if(best_p != 0){
+      best_p->state = RUNNING;
+      best_p->wait_time = 0; 
+
+      c->proc = best_p;
+      swtch(&c->context, &best_p->context);
+
+      c->proc = 0;
+      release(&best_p->lock); 
+
     }
+    
   }
+}
+
+// 设置进程优先级的封装函数
+int
+set_priority(int pid, int priority)
+{
+  struct proc *p;
+
+  // 遍历进程表
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      p->priority = priority;
+      printf("DEBUG: pid %d priority set to %d\n", pid, priority); // 打印这一行
+      p->wait_time = 0; // 重置老化时间
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
 }
 
 // Switch to scheduler.  Must hold only p->lock
