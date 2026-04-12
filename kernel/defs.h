@@ -101,7 +101,10 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
-int             set_priority(int pid, int priority);
+uint64          min_vruntime(void);
+void            update_curr_vruntime(struct proc *p, uint64 exec_delta);
+int             setnice(int pid, int nice);
+int             getnice(int pid);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

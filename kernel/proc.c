@@ -26,6 +26,49 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+#define NICE_MIN   (-2)
+#define NICE_MAX   2
+#define NICE_0_WEIGHT 1024
+#define VRUNTIME_SCALE 1024
+
+// nice:   -2    -1    0     1    2
+static int nice_to_weight[5] = {2048, 1536, 1024, 768, 512};
+
+// 权重映射
+static int
+weight_from_nice(int nice)
+{
+  if(nice < NICE_MIN)
+    nice = NICE_MIN;
+  if(nice > NICE_MAX)
+    nice = NICE_MAX;
+  return nice_to_weight[nice - NICE_MIN];
+}
+
+// 用于给新进程找一个合理的初始 vruntime
+// 寻找最小vruntime赋值给新进程
+uint64 get_min_vruntime(void) 
+{
+  struct proc *p;
+  uint64 min_vruntime = (uint64)-1;
+  int found = 0;
+
+  for(p =proc; p<&proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state==RUNNABLE || p->state==RUNNING) {
+      if(!found || p->vruntime < min_vruntime) {
+        found = 1;
+        min_vruntime = p->vruntime;
+      }
+    }
+    release(&p->lock);
+  }
+
+  if(found) return min_vruntime;
+  return 0;
+}
+
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -112,6 +155,7 @@ allocproc(void)
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
+    p->vruntime = get_min_vruntime();
     acquire(&p->lock);
     if(p->state == UNUSED) {
       goto found;
@@ -125,9 +169,11 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
-  // 初始化优先级,等待时间
-  p->priority = 5;
-  p->wait_time = 0;
+  // CFS初始化
+  p->nice = 0;
+  p->weight = weight_from_nice(p->nice);
+  p->exec_ticks = 0;
+
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -173,6 +219,12 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  // CFS字段
+  p->nice = 0;
+  p->exec_ticks = 0;
+  p->weight = 0;
+  p->vruntime = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -306,6 +358,13 @@ kfork(void)
   np->state = RUNNABLE;
   release(&np->lock);
 
+  acquire(&np->lock);
+  np->nice = p->nice;
+  np->exec_ticks = 0;
+  np->weight = p->weight;
+  np->vruntime = p->vruntime;
+  release(&np->lock);
+
   return pid;
 }
 
@@ -430,6 +489,7 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+  struct proc *best_p;
 
   c->proc = 0;
   for(;;){
@@ -441,8 +501,7 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    struct proc *best_p = 0;
-    int max_priority = -1; // 记录当前发现的最高优先级
+    best_p = 0;
 
     /* 第一轮遍历
      * 寻找优先级最高的 Runnable 进程
@@ -451,21 +510,10 @@ scheduler(void)
     for(p = proc; p < &proc[NPROC]; p++){
       acquire(&p->lock);
       if(p->state == RUNNABLE){
-        // 增加等待时间 
-         p->wait_time++;
-
-         // 计算动态优先级, 基础优先级 + 老化
-         int effective_priority = p->priority + (p->wait_time / 10);
-         if(effective_priority > 20) effective_priority = 20;
-         // int effective_priority = p->priority;
-
-         // 选择最高优先级进程
-        if(effective_priority > max_priority){
+        if(best_p==0 || p->vruntime < best_p->vruntime) {
           if(best_p != 0) {
             release(&best_p->lock);
           }
-
-          max_priority = effective_priority;
           best_p = p;
           continue;
         }
@@ -476,7 +524,6 @@ scheduler(void)
     /* 找到最高优先级进程 */
     if(best_p != 0){
       best_p->state = RUNNING;
-      best_p->wait_time = 0; 
 
       c->proc = best_p;
       swtch(&c->context, &best_p->context);
@@ -489,19 +536,45 @@ scheduler(void)
   }
 }
 
+// 更新当前进程 vruntime 的函数
+// 用于辅助中断程序记账
+void update_curr_vruntime(struct proc *p, uint64 delta_exec)
+{
+  uint64 delta_vruntime;
+
+  if(p == 0) {
+    return;
+  }
+
+  // vruntime += 实际运行时间 × (nice_0_weight / 当前进程权重)
+  // 引入VRUNTIME_SCALE，目的是做定点放大，避免整数除法精度丢失
+  delta_vruntime = (uint64)(delta_exec * NICE_0_WEIGHT * VRUNTIME_SCALE) / p->weight;
+  if(delta_vruntime == 0) {
+    delta_vruntime = 1;
+  }
+
+  p->vruntime += delta_vruntime;
+  p->exec_ticks += 1;
+}
+
+
 // 设置进程优先级的封装函数
 int
-set_priority(int pid, int priority)
+setnice(int pid, int nice)
 {
   struct proc *p;
+
+  if(nice < NICE_MIN || nice > NICE_MAX) {
+    return -1;
+  }
 
   // 遍历进程表
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
-      p->priority = priority;
-      printf("DEBUG: pid %d priority set to %d\n", pid, priority); // 打印这一行
-      p->wait_time = 0; // 重置老化时间
+      p->nice = nice;
+      p->weight = weight_from_nice(nice);
+
       release(&p->lock);
       return 0;
     }
@@ -509,6 +582,26 @@ set_priority(int pid, int priority)
   }
   return -1;
 }
+
+// 获取进程nice值
+int
+getnice(int pid)
+{
+  struct proc *p;
+
+  // 遍历进程表
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      int n = p->nice;
+      release(&p->lock);
+      return n;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores

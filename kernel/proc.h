@@ -105,6 +105,13 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
 
-  int priority;   // 优先级
-  int wait_time;  // 记录在 RUNNABLE 状态等待时间
+  //int priority;   // 优先级
+  //int wait_time;  // 记录在 RUNNABLE 状态等待时间
+
+  // DFS字段
+  uint64 vruntime;    //虚拟运行时间
+  uint64 exec_ticks;  //实际运行tick数
+  int nice;           // nice值，用户态优先级 
+  int weight;         // nice对应权重
+  int slice_ticks;   // 本轮已经连续运行了多少 tick
 };

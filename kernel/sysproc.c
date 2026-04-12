@@ -109,16 +109,21 @@ sys_uptime(void)
 }
 
 uint64
-sys_setpriority(void)
+sys_setnice(void)
 {
-  int priority;
+  int pid, nice;
+
+  argint(0, &pid);
+  argint(1, &nice);
+
+  return setnice(pid, nice);
+}
+
+uint64
+sys_getnice(void)
+{
   int pid;
 
-  argint(1, &priority);
   argint(0, &pid);
-
-  if(priority < 0 || priority > 10) 
-    return -1;
-
-  return set_priority(pid, priority);
+  return getnice(pid);
 }

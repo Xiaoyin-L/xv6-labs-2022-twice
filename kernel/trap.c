@@ -81,8 +81,15 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2){
+    struct proc *p = myproc();
+    if(p && p->state == RUNNING) {
+      acquire(&p->lock);
+      update_curr_vruntime(p, 1);
+      release(&p->lock);
+    }
     yield();
+  }
 
   prepare_return();
 
