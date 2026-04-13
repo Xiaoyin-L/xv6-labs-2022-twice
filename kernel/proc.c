@@ -30,6 +30,7 @@ struct spinlock wait_lock;
 #define NICE_MAX   2
 #define NICE_0_WEIGHT 1024
 #define VRUNTIME_SCALE 1024
+#define MIN_GRANULARITY 2
 
 // nice:   -2    -1    0     1    2
 static int nice_to_weight[5] = {2048, 1536, 1024, 768, 512};
@@ -94,10 +95,23 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+
+  for(int i=0; i<NCPU; i++) {
+    cpus[i].cfs.min_vruntime = 0;
+    cpus[i].cfs.nr_running = 0;
+  }
+
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
+
+      p->vruntime = 0;
+      p->exec_ticks = 0;
+      p->nice = 0;
+      p->weight = 0;
+      p->home_cpu = 0;
+      p->slice_ticks = 0;
   }
 }
 
@@ -155,7 +169,7 @@ allocproc(void)
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
-    p->vruntime = get_min_vruntime();
+    p->vruntime = min_vruntime_cpu(p->home_cpu);
     acquire(&p->lock);
     if(p->state == UNUSED) {
       goto found;
@@ -173,6 +187,10 @@ found:
   p->nice = 0;
   p->weight = weight_from_nice(p->nice);
   p->exec_ticks = 0;
+  p->slice_ticks = 0;
+  p->home_cpu = cpuid();
+  p->last_migrate_tick = 0;
+  
 
 
   // Allocate a trapframe page.
@@ -225,6 +243,299 @@ freeproc(struct proc *p)
   p->exec_ticks = 0;
   p->weight = 0;
   p->vruntime = 0;
+  p->home_cpu = 0;
+  p->slice_ticks = 0;
+  p->last_migrate_tick = 0;
+}
+
+// 辅助函数：统计某个 CPU 上的 runnable 数
+int
+count_runnable_on_cpu(int cpu_id)
+{
+  struct proc *p;
+  int cnt = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == RUNNABLE && p->home_cpu == cpu_id) {
+      cnt++;
+    }
+    release(&p->lock);    
+  }
+  return cnt;
+}
+
+// 辅助函数：寻找某个CPU上最小vruntime
+uint64
+min_vruntime_cpu(int cpu_id)
+{
+  struct proc *p;
+  uint64 min = (uint64)-1;
+  int found = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if((p->state == RUNNABLE || p->state == RUNNABLE) && (p->home_cpu == cpu_id)) {
+      if(!found || p->vruntime < min) {
+        min = p->vruntime;
+        found = 1;
+      }
+    }
+    release(&p->lock);
+  }
+
+  if(found)
+    return min;
+  return 0;
+}
+
+// 辅助函数：更新 CPU 本地 rq 统计
+void
+refresh_cpu_cfs_stats(int cpu_id)
+{
+  cpus[cpu_id].cfs.nr_running = count_runnable_on_cpu(cpu_id);
+  cpus[cpu_id].cfs.min_vruntime = min_vruntime_cpu(cpu_id);
+}
+
+//辅助函数： 选本 CPU 上最小 vruntime 的进程
+struct proc*
+pick_next_proc_on_cpu(int cpu_id)
+{
+  struct proc *p;
+  struct proc *best = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == RUNNABLE && p->home_cpu == cpu_id) {
+      if(best == 0 || p->vruntime < best->vruntime) {
+         if(best != 0)
+          release(&best->lock);
+        best = p;
+        continue;
+      }
+    }
+    release(&p->lock);
+   }
+  return best;
+}
+
+// 更新当前进程 `vruntime`
+void
+update_curr_vruntime(struct proc *p, uint64 delta_exec)
+{
+  uint64 delta_vruntime;
+
+  if(p == 0 || p->weight <= 0)
+    return;
+
+  // vruntime += 实际运行时间 × (nice_0_weight / 当前进程权重)
+  // 引入VRUNTIME_SCALE，目的是做定点放大，避免整数除法精度丢失
+  delta_vruntime = delta_exec * NICE_0_WEIGHT * VRUNTIME_SCALE / p->weight;
+  if(delta_vruntime == 0)
+    delta_vruntime = 1;
+
+  p->vruntime += delta_vruntime;
+  p->exec_ticks += delta_exec;
+}
+
+// 辅助函数：判断当前进程是否应该被抢占
+int
+should_preempt_cfs(struct proc *curr)
+{
+  struct proc *p;
+  int cpu_id;
+  int preempt = 0;
+
+  if(curr == 0)
+    return 0;
+
+  cpu_id = curr->home_cpu;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    if(p == curr) continue;
+    acquire(&p->lock);
+    if(p->state == RUNNABLE && p->home_cpu == cpu_id){
+      if(p->vruntime < curr->vruntime){
+        preempt = 1;
+        release(&p->lock);
+        break;
+      }
+    }
+    release(&p->lock);
+  }
+
+  return preempt;
+}
+
+// 辅助函数
+// 统计某 CPU 的 runnable 总权重
+int
+runnable_weight_on_cpu(int cpu_id)
+{
+  struct proc *p;
+  int load = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE && p->home_cpu == cpu_id)
+      load += p->weight;
+    release(&p->lock);
+  }
+  return load;
+}
+
+// 多核辅助函数
+// 找到除了当前 CPU 之外最忙碌的 CPU，用于负载均衡
+int
+find_busiest_cpu_by_load(void)
+{
+  int i;
+  int busiest = -1;
+  int max_load = -1;
+
+  for(i = 0; i < NCPU; i++){
+    int load = runnable_weight_on_cpu(i);
+    if(load > max_load){
+      max_load = load;
+      busiest = i;
+    }
+  }
+
+  if(max_load == 0)
+    return -1;
+  return busiest;
+}
+
+int
+find_idlest_cpu_by_load(void)
+{
+  int i;
+  int idlest = -1;
+  int min_load = 0x7fffffff;
+
+  for(i = 0; i < 3; i++){
+    int load = runnable_weight_on_cpu(i);
+    if(load < min_load){
+      min_load = load;
+      idlest = i;
+    }
+  }
+
+  return idlest;
+}
+
+// 判断是否需要全局 rebalance
+int
+need_global_rebalance(int *src_cpu, int *dst_cpu)
+{
+  int busiest, idlest;
+  int max_load, min_load;
+  int max_nr, min_nr;
+
+  busiest = find_busiest_cpu_by_load();
+  idlest  = find_idlest_cpu_by_load();
+
+  if(busiest < 0 || idlest < 0 || busiest == idlest)
+    return 0;
+
+  max_load = runnable_weight_on_cpu(busiest);
+  min_load = runnable_weight_on_cpu(idlest);
+
+  max_nr = count_runnable_on_cpu(busiest);
+  min_nr = count_runnable_on_cpu(idlest);
+
+  // 按 load 优先判断，其次参考 runnable 数量
+  if(max_load - min_load >= 1024 ||
+     max_nr   - min_nr   >= 2){
+    *src_cpu = busiest;
+    *dst_cpu = idlest;
+    return 1;
+  }
+
+  return 0;
+}
+
+// 选迁移候选任务
+struct proc*
+pick_migration_candidate(int src_cpu)
+{
+  struct proc *p;
+  struct proc *victim = 0;
+  uint64 now_ticks = ticks;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+
+    if(p->pid <= 3){
+      release(&p->lock);
+      continue;
+    }
+
+    if(p->state == RUNNABLE && p->home_cpu == src_cpu){
+      if(now_ticks - p->last_migrate_tick < 20){
+        release(&p->lock);
+        continue;
+      }
+
+      if(victim == 0 || p->vruntime > victim->vruntime){
+        if(victim != 0)
+          release(&victim->lock);
+        victim = p;
+        continue;
+      }
+    }
+
+    release(&p->lock);
+  }
+
+  return victim; // 返回时若非空，victim->lock 仍持有
+}
+
+// 迁移一个任务
+struct proc*
+migrate_one_task(int src_cpu, int dst_cpu)
+{
+  struct proc *p;
+  uint64 dst_min;
+  // uint64 old_vr;
+  uint64 now_ticks = ticks;
+
+  if(src_cpu < 0 || dst_cpu < 0 || src_cpu == dst_cpu)
+    return 0;
+
+  dst_min = min_vruntime_cpu(dst_cpu);
+
+  p = pick_migration_candidate(src_cpu);
+  if(p == 0)
+    return 0;
+
+  //old_vr = p->vruntime;
+  
+
+  p->home_cpu = dst_cpu;
+
+  // 迁移后只允许抬高，不允许降低
+  if(p->vruntime < dst_min)
+    p->vruntime = dst_min;
+
+  p->last_migrate_tick = now_ticks;
+
+  // printf("migrate: pid=%d from cpu%d to cpu%d old_vr=%d new_vr=%d\n",
+  //       p->pid, src_cpu, dst_cpu, (int)old_vr, (int)p->vruntime);
+
+  release(&p->lock);
+  return p;
+}
+
+//rebalance 函数
+void
+rebalance_cfs(void)
+{
+  int src_cpu, dst_cpu;
+
+  if(need_global_rebalance(&src_cpu, &dst_cpu)){
+    migrate_one_task(src_cpu, dst_cpu);
+  }
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -363,7 +674,12 @@ kfork(void)
   np->exec_ticks = 0;
   np->weight = p->weight;
   np->vruntime = p->vruntime;
+  np->slice_ticks = 0;
+  np->home_cpu = np->pid % 2; // 简单的负载均衡：新进程先放到自己 PID 对应的 CPU 上
   release(&np->lock);
+
+  printf("fork/alloc: pid=%d home_cpu=%d nice=%d vruntime=%d\n",
+       np->pid, np->home_cpu, np->nice, (int)np->vruntime);
 
   return pid;
 }
@@ -489,7 +805,7 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  struct proc *best_p;
+  int id = cpuid();
 
   c->proc = 0;
   for(;;){
@@ -501,60 +817,29 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    best_p = 0;
+    refresh_cpu_cfs_stats(id);
 
-    /* 第一轮遍历
-     * 寻找优先级最高的 Runnable 进程
-     * 更新所有 Runnable 进程的等待时间
-    */
-    for(p = proc; p < &proc[NPROC]; p++){
-      acquire(&p->lock);
-      if(p->state == RUNNABLE){
-        if(best_p==0 || p->vruntime < best_p->vruntime) {
-          if(best_p != 0) {
-            release(&best_p->lock);
-          }
-          best_p = p;
-          continue;
-        }
-      }
-      release(&p->lock);
+    // 先选本 CPU 自己的任务
+    p = pick_next_proc_on_cpu(id);
+
+    // 本地没任务，则尝试从别的 CPU steal
+    if(p == 0){
+      rebalance_cfs();
+      p = pick_next_proc_on_cpu(id);
     }
 
-    /* 找到最高优先级进程 */
-    if(best_p != 0){
-      best_p->state = RUNNING;
+    if(p != 0) {
+      p->state = RUNNING;
+      p->slice_ticks = 0;
+      c->proc = p;
 
-      c->proc = best_p;
-      swtch(&c->context, &best_p->context);
+      swtch(&c->context, &p->context);
 
       c->proc = 0;
-      release(&best_p->lock); 
+      release(&p->lock);
 
     }
-    
   }
-}
-
-// 更新当前进程 vruntime 的函数
-// 用于辅助中断程序记账
-void update_curr_vruntime(struct proc *p, uint64 delta_exec)
-{
-  uint64 delta_vruntime;
-
-  if(p == 0) {
-    return;
-  }
-
-  // vruntime += 实际运行时间 × (nice_0_weight / 当前进程权重)
-  // 引入VRUNTIME_SCALE，目的是做定点放大，避免整数除法精度丢失
-  delta_vruntime = (uint64)(delta_exec * NICE_0_WEIGHT * VRUNTIME_SCALE) / p->weight;
-  if(delta_vruntime == 0) {
-    delta_vruntime = 1;
-  }
-
-  p->vruntime += delta_vruntime;
-  p->exec_ticks += 1;
 }
 
 

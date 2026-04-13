@@ -83,14 +83,28 @@ usertrap(void)
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2){
     struct proc *p = myproc();
+    int need_preempt = 0;
+
     if(p && p->state == RUNNING) {
       acquire(&p->lock);
       update_curr_vruntime(p, 1);
+      p->slice_ticks++;
+
+      if(p->slice_ticks >= 2) {
+        need_preempt = 1;
+      }
+      need_preempt = need_preempt && should_preempt_cfs(p);
       release(&p->lock);
     }
-    yield();
-  }
 
+     if(ticks % 20 == 0) {
+      rebalance_cfs();
+     }
+
+     if(need_preempt) {
+       yield();
+     }
+  }
   prepare_return();
 
   // the user page table to switch to, for trampoline.S

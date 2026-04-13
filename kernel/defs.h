@@ -101,10 +101,22 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
-uint64          min_vruntime(void);
+uint64          get_min_vruntime(void);
 void            update_curr_vruntime(struct proc *p, uint64 exec_delta);
 int             setnice(int pid, int nice);
 int             getnice(int pid);
+int     count_runnable_on_cpu(int cpu_id);
+int     runnable_weight_on_cpu(int cpu_id);
+uint64  min_vruntime_cpu(int cpu_id);
+
+int     find_busiest_cpu_by_load(void);
+int     find_idlest_cpu_by_load(void);
+int     need_global_rebalance(int *src_cpu, int *dst_cpu);
+int     should_preempt_cfs(struct proc *curr);
+
+struct proc* pick_migration_candidate(int src_cpu);
+struct proc* migrate_one_task(int src_cpu, int dst_cpu);
+void    rebalance_cfs(void);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

@@ -18,12 +18,20 @@ struct context {
   uint64 s11;
 };
 
+// 调度队列的信息
+struct cfs_rq {
+  uint64 min_vruntime;
+  int nr_running;
+};
+
 // Per-CPU state.
 struct cpu {
   struct proc *proc;          // The process running on this cpu, or null.
   struct context context;     // swtch() here to enter scheduler().
   int noff;                   // Depth of push_off() nesting.
   int intena;                 // Were interrupts enabled before push_off()?
+
+  struct cfs_rq cfs;       // CFS调度队列
 };
 
 extern struct cpu cpus[NCPU];
@@ -114,4 +122,8 @@ struct proc {
   int nice;           // nice值，用户态优先级 
   int weight;         // nice对应权重
   int slice_ticks;   // 本轮已经连续运行了多少 tick
+
+  // ===== multi-core fields =====
+  int home_cpu;       // 当前归属哪个 CPU 的 runqueue
+  uint64 last_migrate_tick;
 };
